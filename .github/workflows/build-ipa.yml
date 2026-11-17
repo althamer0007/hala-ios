@@ -7,17 +7,42 @@ on:
   push:
   workflow_dispatch:
 
+#
+# App Store / TestFlight (after joining the Apple Developer Program):
+#   Settings → Secrets and variables → Actions → New repository secret, add:
+#     APPLE_TEAM_ID       – Team ID (developer.apple.com → Membership)
+#     ASC_KEY_ID          – App Store Connect API key ID (Users and Access → Integrations, role: Admin)
+#     ASC_ISSUER_ID       – Issuer ID shown on the same page
+#     ASC_KEY_P8          – full text of the downloaded AuthKey_XXXX.p8 file
+#   and create the app in App Store Connect with bundle ID sa.matl.rentals.
+#   Every build then also signs Hala and uploads it to TestFlight automatically.
+
 env:
   HALA_URL: https://hala-app-p16c.netlify.app/
   BUNDLE_ID: sa.matl.rentals
   VERSION: "1.31"
-  BUILD: "32"
 
 jobs:
   ipa:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 40
+    env:
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+      ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+      ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
     steps:
+      - name: Prepare
+        run: |
+          # build number must grow with every upload to Apple
+          echo "BUILD=$((100 + GITHUB_RUN_NUMBER))" >> "$GITHUB_ENV"
+          if [ -n "$APPLE_TEAM_ID" ] && [ -n "$ASC_KEY_ID" ] && [ -n "$ASC_ISSUER_ID" ] && [ -n "$ASC_KEY_P8" ]; then
+            echo "SIGNED=true" >> "$GITHUB_ENV"; echo "App Store signing: ON"
+          else
+            echo "SIGNED=false" >> "$GITHUB_ENV"; echo "App Store signing: OFF (secrets not set) – unsigned IPA only"
+          fi
+          xcodebuild -version
+
       - name: Install XcodeGen
         run: brew install xcodegen
 
@@ -64,9 +89,8 @@ jobs:
                   TARGETED_DEVICE_FAMILY: "1"
                   SWIFT_VERSION: "5.0"
                   ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
-                  CODE_SIGNING_ALLOWED: "NO"
-                  CODE_SIGNING_REQUIRED: "NO"
-                  CODE_SIGN_IDENTITY: ""
+                  CODE_SIGN_STYLE: Automatic
+                  DEVELOPMENT_TEAM: "$APPLE_TEAM_ID"
           EOF
 
           cat > Hala/AppDelegate.swift <<'EOF'
@@ -236,9 +260,17 @@ jobs:
           }
           EOF
 
-          # app icon: Hala's 512px icon from the site, enlarged to 1024
+          # app icon: Hala's 512px icon from the site, enlarged to 1024 on a solid navy
+          # background (the App Store rejects icons with transparency)
           curl -fsSL "${HALA_URL}icon-512.png" -o /tmp/icon.png
-          sips -z 1024 1024 /tmp/icon.png --out Hala/Assets.xcassets/AppIcon.appiconset/AppIcon.png >/dev/null
+          python3 -m pip install -q --break-system-packages pillow 2>/dev/null || python3 -m pip install -q pillow
+          python3 - <<'PY'
+          from PIL import Image
+          src = Image.open('/tmp/icon.png').convert('RGBA').resize((1024, 1024), Image.LANCZOS)
+          bg = Image.new('RGBA', src.size, (31, 59, 115, 255))
+          bg.alpha_composite(src)
+          bg.convert('RGB').save('Hala/Assets.xcassets/AppIcon.appiconset/AppIcon.png')
+          PY
           cat > Hala/Assets.xcassets/Contents.json <<'EOF'
           {"info":{"author":"xcode","version":1}}
           EOF
@@ -248,18 +280,52 @@ jobs:
 
           xcodegen generate
 
-      - name: Build
+      - name: Build unsigned IPA (Sideloadly)
         run: |
           set -eo pipefail
           cd ios
           xcodebuild -project Hala.xcodeproj -target Hala -configuration Release -sdk iphoneos \
-            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build | tail -25
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" DEVELOPMENT_TEAM="" build | tail -25
           mkdir -p out/Payload
           cp -R build/Release-iphoneos/Hala.app out/Payload/
-          cd out && zip -qry "Hala-$VERSION.ipa" Payload && ls -la
+          cd out && zip -qry "Hala-$VERSION-unsigned.ipa" Payload && ls -la
 
-      - name: Upload IPA
+      - name: Upload unsigned IPA
         uses: actions/upload-artifact@v4
         with:
           name: Hala-${{ env.VERSION }}-ipa
-          path: ios/out/Hala-*.ipa
+          path: ios/out/Hala-*-unsigned.ipa
+
+      - name: Sign and upload to TestFlight
+        if: env.SIGNED == 'true'
+        run: |
+          set -eo pipefail
+          cd ios
+          mkdir -p ~/.appstoreconnect/private_keys
+          KEY=~/.appstoreconnect/private_keys/AuthKey_$ASC_KEY_ID.p8
+          printf '%s\n' "$ASC_KEY_P8" > "$KEY"
+          AUTH=(-allowProvisioningUpdates -authenticationKeyPath "$KEY" -authenticationKeyID "$ASC_KEY_ID" -authenticationKeyIssuerID "$ASC_ISSUER_ID")
+
+          xcodebuild -project Hala.xcodeproj -scheme Hala -configuration Release \
+            -destination 'generic/platform=iOS' -archivePath out/Hala.xcarchive \
+            DEVELOPMENT_TEAM="$APPLE_TEAM_ID" CODE_SIGN_STYLE=Automatic \
+            "${AUTH[@]}" archive | tail -30
+
+          cat > out/ExportOptions.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+            <key>method</key><string>app-store-connect</string>
+            <key>destination</key><string>upload</string>
+            <key>teamID</key><string>$APPLE_TEAM_ID</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>uploadSymbols</key><true/>
+            <key>manageAppVersionAndBuildNumber</key><false/>
+          </dict></plist>
+          EOF
+
+          xcodebuild -exportArchive -archivePath out/Hala.xcarchive \
+            -exportOptionsPlist out/ExportOptions.plist -exportPath out/appstore \
+            "${AUTH[@]}" | tail -30
+          echo "✅ Hala $VERSION ($BUILD) uploaded to App Store Connect – it appears in TestFlight after Apple processes it (5–30 min)."
+          rm -f "$KEY"
